@@ -90,13 +90,9 @@ def build_ffmpeg_cmd() -> list[str]:
         # Audio input
         "-f", "alsa",
         "-i", CONFIG["audio_card"],
-        # Video encode — RPi 4B hardware H.264
-        "-c:v", "h264_v4l2m2m",
-        "-pix_fmt", "yuv420p",
-        "-b:v", CONFIG["video_bitrate"],
-        "-maxrate", CONFIG["video_bitrate"],
-        "-bufsize", str(int(CONFIG["video_bitrate"].replace("k", "")) * 2) + "k",
-        "-g", str(int(CONFIG["framerate"]) * 2),  # keyframe every 2s
+        # Video — keep camera MJPEG as-is. Hardware H.264 path produced rainbow output
+        # on this capture device, while MJPEG passthrough is known-good.
+        "-c:v", "copy",
         # Audio encode
         "-c:a", "aac",
         "-b:a", "128k",
