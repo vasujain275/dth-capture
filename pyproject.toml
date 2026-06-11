@@ -1,0 +1,10 @@
+[project]
+name = "dth-to-minio"
+version = "0.1.0"
+description = "DTH capture → 1-min segments → MinIO uploader"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "minio>=7.2",
+    "watchdog>=4.0",
+]

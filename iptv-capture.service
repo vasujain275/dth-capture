@@ -1,0 +1,23 @@
+[Unit]
+Description=IPTV DTH Capture and MinIO Upload
+After=network.target
+
+[Service]
+User=rpi4b
+WorkingDirectory=/home/rpi4b/dth-to-minio
+# Environment overrides — edit these for your MinIO
+Environment="MINIO_ENDPOINT=192.168.1.10:9000"
+Environment="MINIO_ACCESS_KEY=minioadmin"
+Environment="MINIO_SECRET_KEY=minioadmin"
+Environment="MINIO_BUCKET=cnbc-awaaz-segments"
+Environment="CHANNEL_NAME=cnbc-awaaz"
+Environment="VIDEO_DEV=/dev/video0"
+Environment="AUDIO_CARD=hw:3,0"
+ExecStart=/home/rpi4b/.local/bin/uv run capture.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
