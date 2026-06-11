@@ -1,9 +1,10 @@
 """
-cnbc-iptv: DTH capture → 1-minute .ts segments → MinIO
-=======================================================
+cnbc-iptv: DTH capture → 1-minute .mp4 clips → MinIO
+=====================================================
 Two independent threads:
-  1. ffmpeg  — captures V4L2/ALSA input, writes 60s .ts segments to ./segments/
-  2. Uploader — watches ./segments/ for completed files, uploads to MinIO, deletes local copy
+  1. ffmpeg   — captures V4L2/ALSA input, writes 60s .ts segments to ./segments/
+  2. Uploader — watches ./segments/ for completed .ts files, remuxes to .mp4,
+                uploads .mp4 to MinIO, deletes local copies
 
 Usage:
     uv run capture.py
@@ -132,6 +133,7 @@ def run_ffmpeg():
         )
 
         # Stream stderr line-by-line so we see ffmpeg warnings in real time
+        assert proc.stderr is not None  # guaranteed by stderr=subprocess.PIPE
         for line in proc.stderr:
             decoded = line.decode(errors="replace").rstrip()
             if decoded:
@@ -164,16 +166,59 @@ def stale_segment_watchdog():
     """
     while True:
         time.sleep(CONFIG["stale_warn_secs"])
+        mp4_files = sorted(SEGMENTS_DIR.glob("*.mp4"))
         ts_files = sorted(SEGMENTS_DIR.glob("*.ts"))
-        if not ts_files:
+        all_files = mp4_files + ts_files
+        if not all_files:
             continue
-        latest = ts_files[-1]
+        latest = sorted(all_files, key=lambda f: f.stat().st_mtime)[-1]
         age = time.time() - latest.stat().st_mtime
         if age > CONFIG["stale_warn_secs"]:
             log.warning(
                 f"[watchdog] No new segment in {age:.0f}s — "
                 f"ffmpeg may be stalled. Latest: {latest.name}"
             )
+
+
+# ── TS → MP4 remux ────────────────────────────────────────────────────────────
+
+def remux_to_mp4(ts_path: Path) -> Path | None:
+    """
+    Remux a .ts segment to .mp4 using stream copy (no re-encode).
+    Returns the path to the new .mp4 file, or None on failure.
+    """
+    mp4_path = ts_path.with_suffix(".mp4")
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel", "error",
+        "-i", str(ts_path),
+        "-c", "copy",
+        "-movflags", "+faststart",
+        "-y",
+        str(mp4_path),
+    ]
+    try:
+        log.info(f"[remux] {ts_path.name} → {mp4_path.name}")
+        result = subprocess.run(cmd, capture_output=True, timeout=30)
+        if result.returncode != 0:
+            stderr = result.stderr.decode(errors="replace").strip()
+            log.error(f"[remux] ✗ Failed (rc={result.returncode}): {stderr}")
+            return None
+        # Verify output exists and is non-trivial
+        if not mp4_path.exists() or mp4_path.stat().st_size < 1024:
+            log.error(f"[remux] ✗ Output missing or too small: {mp4_path.name}")
+            return None
+        # Remove source .ts after successful remux
+        ts_path.unlink()
+        log.info(f"[remux] ✓ Done, deleted source: {ts_path.name}")
+        return mp4_path
+    except subprocess.TimeoutExpired:
+        log.error(f"[remux] ✗ Timed out after 30s: {ts_path.name}")
+        return None
+    except Exception as e:
+        log.error(f"[remux] ✗ Unexpected error: {e}")
+        return None
 
 
 # ── MinIO uploader ─────────────────────────────────────────────────────────────
@@ -198,13 +243,13 @@ def ensure_bucket(client: Minio):
 
 def upload_with_retry(filepath: Path) -> bool:
     """
-    Uploads a single .ts file to MinIO with retries.
+    Uploads a single .mp4 clip to MinIO with retries.
     Returns True on success, False after all retries exhausted.
     Deletes the local file only on confirmed upload success.
     """
     bucket   = CONFIG["minio_bucket"]
     filename = filepath.name
-    # Object key: channel/YYYYMMDD/filename.ts  — easy to browse in MinIO
+    # Object key: channel/YYYYMMDD/filename.mp4  — easy to browse in MinIO
     date_str   = datetime.now(timezone.utc).strftime("%Y%m%d")
     object_key = f"{CONFIG['channel_name']}/{date_str}/{filename}"
 
@@ -220,7 +265,7 @@ def upload_with_retry(filepath: Path) -> bool:
                 bucket_name=bucket,
                 object_name=object_key,
                 file_path=str(filepath),
-                content_type="video/MP2T",
+                content_type="video/mp4",
             )
             log.info(f"[upload] ✓ Success: {object_key}")
             filepath.unlink()
@@ -252,14 +297,17 @@ def upload_with_retry(filepath: Path) -> bool:
 class SegmentHandler(FileSystemEventHandler):
     """
     Handles new .ts files written by ffmpeg's segment muxer.
-    ffmpeg closes the file when a segment is complete — we upload on close.
+    ffmpeg closes the file when a segment is complete — we queue it for
+    remux → upload in the main loop.
     """
 
     def __init__(self, upload_queue: list):
         self._queue = upload_queue
         self._lock  = threading.Lock()
 
-    def _handle(self, path: str):
+    def _handle(self, path: str | bytes):
+        if isinstance(path, bytes):
+            path = path.decode()
         if not path.endswith(".ts"):
             return
         filepath = Path(path)
@@ -288,17 +336,26 @@ class SegmentHandler(FileSystemEventHandler):
 
 def run_uploader():
     """
-    Watches segments/ directory and uploads completed .ts files to MinIO.
-    Runs in the main thread after starting ffmpeg in a background thread.
+    Watches segments/ directory for completed .ts files, remuxes to .mp4,
+    and uploads to MinIO. Runs in the main thread after starting ffmpeg
+    in a background thread.
     """
     client = get_minio_client()
     ensure_bucket(client)
 
-    # Upload any leftover segments from a previous run (e.g. after reboot)
-    leftover = sorted(SEGMENTS_DIR.glob("*.ts"))
-    if leftover:
-        log.info(f"[upload] Found {len(leftover)} leftover segment(s) from previous run")
-        for f in leftover:
+    # Upload any leftover files from a previous run (e.g. after reboot)
+    # Handle .ts files first (remux then upload), then any .mp4 files
+    leftover_ts = sorted(SEGMENTS_DIR.glob("*.ts"))
+    leftover_mp4 = sorted(SEGMENTS_DIR.glob("*.mp4"))
+    if leftover_ts:
+        log.info(f"[upload] Found {len(leftover_ts)} leftover .ts segment(s), remuxing...")
+        for f in leftover_ts:
+            mp4 = remux_to_mp4(f)
+            if mp4:
+                upload_with_retry(mp4)
+    if leftover_mp4:
+        log.info(f"[upload] Found {len(leftover_mp4)} leftover .mp4 clip(s) from previous run")
+        for f in leftover_mp4:
             upload_with_retry(f)
 
     upload_queue: list[str] = []
@@ -311,8 +368,14 @@ def run_uploader():
     try:
         while True:
             if upload_queue:
-                path = upload_queue.pop(0)
-                upload_with_retry(Path(path))
+                ts_path = Path(upload_queue.pop(0))
+                # Step 1: Remux .ts → .mp4
+                mp4_path = remux_to_mp4(ts_path)
+                if mp4_path is None:
+                    log.error(f"[pipeline] Remux failed, skipping: {ts_path.name}")
+                    continue
+                # Step 2: Upload .mp4
+                upload_with_retry(mp4_path)
             else:
                 time.sleep(0.2)
     except KeyboardInterrupt:
@@ -330,7 +393,7 @@ def main():
     log.info(f"  Channel  : {CONFIG['channel_name']}")
     log.info(f"  Video    : {CONFIG['video_dev']} @ {CONFIG['resolution']}p{CONFIG['framerate']}")
     log.info(f"  Audio    : {CONFIG['audio_card']}")
-    log.info(f"  Segments : {SEGMENTS_DIR} ({CONFIG['segment_secs']}s each)")
+    log.info(f"  Segments : {SEGMENTS_DIR} ({CONFIG['segment_secs']}s each → .mp4 clips)")
     log.info(f"  MinIO    : {CONFIG['minio_endpoint']} / {CONFIG['minio_bucket']}")
     log.info("=" * 60)
 

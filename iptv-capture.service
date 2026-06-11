@@ -7,6 +7,7 @@ User=rpi4b
 WorkingDirectory=/home/rpi4b/dth-to-minio
 # Environment overrides — edit these for your MinIO
 Environment="MINIO_ENDPOINT=192.168.1.10:9000"
+Environment="MINIO_SECURE=true"
 Environment="MINIO_ACCESS_KEY=minioadmin"
 Environment="MINIO_SECRET_KEY=minioadmin"
 Environment="MINIO_BUCKET=cnbc-awaaz-segments"
