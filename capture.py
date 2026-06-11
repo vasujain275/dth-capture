@@ -2,8 +2,8 @@
 cnbc-iptv: DTH capture → 1-minute .mp4 clips → MinIO
 =====================================================
 Two independent threads:
-  1. ffmpeg   — captures V4L2/ALSA input, writes 60s .ts segments to ./segments/
-  2. Uploader — watches ./segments/ for completed .ts files, remuxes to .mp4,
+  1. ffmpeg   — captures V4L2/ALSA input, writes 60s .mkv segments to ./segments/
+  2. Uploader — watches ./segments/ for completed .mkv files, remuxes to .mp4,
                 uploads .mp4 to MinIO, deletes local copies
 
 Usage:
@@ -75,7 +75,7 @@ SEGMENTS_DIR.mkdir(parents=True, exist_ok=True)
 
 def build_ffmpeg_cmd() -> list[str]:
     segment_pattern = str(
-        SEGMENTS_DIR / f"{CONFIG['channel_name']}_%Y%m%d_%H%M%S.ts"
+        SEGMENTS_DIR / f"{CONFIG['channel_name']}_%Y%m%d_%H%M%S.mkv"
     )
     return [
         "ffmpeg",
@@ -105,7 +105,7 @@ def build_ffmpeg_cmd() -> list[str]:
         # Segment muxer
         "-f", "segment",
         "-segment_time", str(CONFIG["segment_secs"]),
-        "-segment_format", "mpegts",
+        "-segment_format", "matroska",
         "-reset_timestamps", "1",
         "-strftime", "1",
         segment_pattern,
@@ -161,14 +161,14 @@ def run_ffmpeg():
 
 def stale_segment_watchdog():
     """
-    Background thread — warns if no new .ts segment appears within stale_warn_secs.
+    Background thread — warns if no new segment appears within stale_warn_secs.
     Indicates ffmpeg has stalled without crashing.
     """
     while True:
         time.sleep(CONFIG["stale_warn_secs"])
         mp4_files = sorted(SEGMENTS_DIR.glob("*.mp4"))
-        ts_files = sorted(SEGMENTS_DIR.glob("*.ts"))
-        all_files = mp4_files + ts_files
+        mkv_files = sorted(SEGMENTS_DIR.glob("*.mkv"))
+        all_files = mp4_files + mkv_files
         if not all_files:
             continue
         latest = sorted(all_files, key=lambda f: f.stat().st_mtime)[-1]
@@ -180,26 +180,26 @@ def stale_segment_watchdog():
             )
 
 
-# ── TS → MP4 remux ────────────────────────────────────────────────────────────
+# ── MKV → MP4 remux ───────────────────────────────────────────────────────────
 
-def remux_to_mp4(ts_path: Path) -> Path | None:
+def remux_to_mp4(src_path: Path) -> Path | None:
     """
-    Remux a .ts segment to .mp4 using stream copy (no re-encode).
+    Remux a .mkv segment to .mp4 using stream copy (no re-encode).
     Returns the path to the new .mp4 file, or None on failure.
     """
-    mp4_path = ts_path.with_suffix(".mp4")
+    mp4_path = src_path.with_suffix(".mp4")
     cmd = [
         "ffmpeg",
         "-hide_banner",
         "-loglevel", "error",
-        "-i", str(ts_path),
+        "-i", str(src_path),
         "-c", "copy",
         "-movflags", "+faststart",
         "-y",
         str(mp4_path),
     ]
     try:
-        log.info(f"[remux] {ts_path.name} → {mp4_path.name}")
+        log.info(f"[remux] {src_path.name} → {mp4_path.name}")
         result = subprocess.run(cmd, capture_output=True, timeout=30)
         if result.returncode != 0:
             stderr = result.stderr.decode(errors="replace").strip()
@@ -209,12 +209,12 @@ def remux_to_mp4(ts_path: Path) -> Path | None:
         if not mp4_path.exists() or mp4_path.stat().st_size < 1024:
             log.error(f"[remux] ✗ Output missing or too small: {mp4_path.name}")
             return None
-        # Remove source .ts after successful remux
-        ts_path.unlink()
-        log.info(f"[remux] ✓ Done, deleted source: {ts_path.name}")
+        # Remove source .mkv after successful remux
+        src_path.unlink()
+        log.info(f"[remux] ✓ Done, deleted source: {src_path.name}")
         return mp4_path
     except subprocess.TimeoutExpired:
-        log.error(f"[remux] ✗ Timed out after 30s: {ts_path.name}")
+        log.error(f"[remux] ✗ Timed out after 30s: {src_path.name}")
         return None
     except Exception as e:
         log.error(f"[remux] ✗ Unexpected error: {e}")
@@ -296,7 +296,7 @@ def upload_with_retry(filepath: Path) -> bool:
 
 class SegmentHandler(FileSystemEventHandler):
     """
-    Handles new .ts files written by ffmpeg's segment muxer.
+    Handles new .mkv files written by ffmpeg's segment muxer.
     ffmpeg closes the file when a segment is complete — we queue it for
     remux → upload in the main loop.
     """
@@ -308,7 +308,7 @@ class SegmentHandler(FileSystemEventHandler):
     def _handle(self, path: str | bytes):
         if isinstance(path, bytes):
             path = path.decode()
-        if not path.endswith(".ts"):
+        if not path.endswith(".mkv"):
             return
         filepath = Path(path)
         if not filepath.exists():
@@ -336,7 +336,7 @@ class SegmentHandler(FileSystemEventHandler):
 
 def run_uploader():
     """
-    Watches segments/ directory for completed .ts files, remuxes to .mp4,
+    Watches segments/ directory for completed .mkv files, remuxes to .mp4,
     and uploads to MinIO. Runs in the main thread after starting ffmpeg
     in a background thread.
     """
@@ -344,12 +344,12 @@ def run_uploader():
     ensure_bucket(client)
 
     # Upload any leftover files from a previous run (e.g. after reboot)
-    # Handle .ts files first (remux then upload), then any .mp4 files
-    leftover_ts = sorted(SEGMENTS_DIR.glob("*.ts"))
+    # Handle .mkv files first (remux then upload), then any .mp4 files
+    leftover_mkv = sorted(SEGMENTS_DIR.glob("*.mkv"))
     leftover_mp4 = sorted(SEGMENTS_DIR.glob("*.mp4"))
-    if leftover_ts:
-        log.info(f"[upload] Found {len(leftover_ts)} leftover .ts segment(s), remuxing...")
-        for f in leftover_ts:
+    if leftover_mkv:
+        log.info(f"[upload] Found {len(leftover_mkv)} leftover .mkv segment(s), remuxing...")
+        for f in leftover_mkv:
             mp4 = remux_to_mp4(f)
             if mp4:
                 upload_with_retry(mp4)
@@ -368,11 +368,11 @@ def run_uploader():
     try:
         while True:
             if upload_queue:
-                ts_path = Path(upload_queue.pop(0))
-                # Step 1: Remux .ts → .mp4
-                mp4_path = remux_to_mp4(ts_path)
+                mkv_path = Path(upload_queue.pop(0))
+                # Step 1: Remux .mkv → .mp4
+                mp4_path = remux_to_mp4(mkv_path)
                 if mp4_path is None:
-                    log.error(f"[pipeline] Remux failed, skipping: {ts_path.name}")
+                    log.error(f"[pipeline] Remux failed, skipping: {mkv_path.name}")
                     continue
                 # Step 2: Upload .mp4
                 upload_with_retry(mp4_path)
