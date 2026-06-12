@@ -12,6 +12,7 @@ Usage:
 Config via environment variables (or edit the CONFIG block below).
 """
 
+import json
 import logging
 import os
 import subprocess
@@ -65,6 +66,9 @@ CONFIG = {
 
     # Stale segment watchdog — warn if no new segment after this many seconds
     "stale_warn_secs": int(os.getenv("STALE_WARN_SECS", "90")),
+
+    # Validation — reject partial files before upload
+    "min_segment_secs": int(os.getenv("MIN_SEGMENT_SECS", "55")),
 }
 
 # ── Setup ──────────────────────────────────────────────────────────────────────
@@ -174,6 +178,92 @@ def stale_segment_watchdog():
             )
 
 
+# ── Segment validation ─────────────────────────────────────────────────────────
+
+def mark_bad_segment(filepath: Path, reason: str):
+    """Keep bad segment for inspection, but prevent endless upload retries."""
+    bad_path = filepath.with_suffix(filepath.suffix + ".bad")
+    try:
+        filepath.rename(bad_path)
+        log.error(f"[validate] ✗ {reason}. Moved bad segment: {bad_path.name}")
+    except FileNotFoundError:
+        log.warning(f"[validate] File disappeared before marking bad: {filepath.name}")
+    except Exception as e:
+        log.error(f"[validate] ✗ {reason}. Failed to mark bad segment {filepath.name}: {e}")
+
+
+def validate_segment(filepath: Path) -> bool:
+    """
+    Validate completed .mkv before upload.
+    Rejects partial/early files, audio-only files, and files without audio.
+    """
+    if not filepath.exists():
+        log.warning(f"[validate] File disappeared: {filepath.name}")
+        return False
+
+    if filepath.stat().st_size < 1024 * 1024:
+        mark_bad_segment(filepath, "File too small")
+        return False
+
+    cmd = [
+        "ffprobe",
+        "-v", "error",
+        "-print_format", "json",
+        "-show_format",
+        "-show_streams",
+        str(filepath),
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+    except subprocess.TimeoutExpired:
+        mark_bad_segment(filepath, "ffprobe timed out")
+        return False
+    except Exception as e:
+        mark_bad_segment(filepath, f"ffprobe failed: {e}")
+        return False
+
+    if result.returncode != 0:
+        err = result.stderr.strip() or "unknown ffprobe error"
+        mark_bad_segment(filepath, f"ffprobe rejected file: {err}")
+        return False
+
+    try:
+        info = json.loads(result.stdout)
+    except json.JSONDecodeError as e:
+        mark_bad_segment(filepath, f"ffprobe returned invalid JSON: {e}")
+        return False
+
+    streams = info.get("streams", [])
+    has_video = any(s.get("codec_type") == "video" for s in streams)
+    has_audio = any(s.get("codec_type") == "audio" for s in streams)
+    if not has_video:
+        mark_bad_segment(filepath, "No video stream")
+        return False
+    if not has_audio:
+        mark_bad_segment(filepath, "No audio stream")
+        return False
+
+    duration_raw = info.get("format", {}).get("duration")
+    try:
+        duration = float(duration_raw)
+    except (TypeError, ValueError):
+        mark_bad_segment(filepath, "Could not read duration")
+        return False
+
+    if duration < CONFIG["min_segment_secs"]:
+        mark_bad_segment(
+            filepath,
+            f"Segment too short: {duration:.1f}s < {CONFIG['min_segment_secs']}s",
+        )
+        return False
+
+    log.info(
+        f"[validate] ✓ {filepath.name}: {duration:.1f}s, "
+        f"{filepath.stat().st_size / 1024 / 1024:.1f} MB, audio+video"
+    )
+    return True
+
+
 # ── MinIO uploader ─────────────────────────────────────────────────────────────
 
 def get_minio_client() -> Minio:
@@ -278,13 +368,6 @@ class SegmentHandler(FileSystemEventHandler):
         if not event.is_directory:
             self._handle(event.src_path)
 
-    # Fallback for systems where on_closed isn't fired (older kernels)
-    def on_created(self, event):
-        if not event.is_directory:
-            # Small delay to let ffmpeg finish writing
-            time.sleep(0.5)
-            self._handle(event.src_path)
-
 
 def run_uploader():
     """
@@ -299,7 +382,8 @@ def run_uploader():
     if leftover_mkv:
         log.info(f"[upload] Found {len(leftover_mkv)} leftover .mkv segment(s) from previous run")
         for f in leftover_mkv:
-            upload_with_retry(f)
+            if validate_segment(f):
+                upload_with_retry(f)
 
     upload_queue: list[str] = []
     handler  = SegmentHandler(upload_queue)
@@ -312,7 +396,8 @@ def run_uploader():
         while True:
             if upload_queue:
                 mkv_path = Path(upload_queue.pop(0))
-                upload_with_retry(mkv_path)
+                if validate_segment(mkv_path):
+                    upload_with_retry(mkv_path)
             else:
                 time.sleep(0.2)
     except KeyboardInterrupt:
@@ -331,6 +416,7 @@ def main():
     log.info(f"  Video    : {CONFIG['video_dev']} @ {CONFIG['resolution']}p{CONFIG['framerate']}")
     log.info(f"  Audio    : {CONFIG['audio_card']}")
     log.info(f"  Segments : {SEGMENTS_DIR} ({CONFIG['segment_secs']}s each → .mkv clips)")
+    log.info(f"  Min dur  : {CONFIG['min_segment_secs']}s before upload")
     log.info(f"  MinIO    : {CONFIG['minio_endpoint']} / {CONFIG['minio_bucket']}")
     log.info("=" * 60)
 
