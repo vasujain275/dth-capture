@@ -50,8 +50,10 @@ CONFIG = {
     # ffmpeg encode settings
     "resolution":   os.getenv("RESOLUTION",   "1280x720"),
     "framerate":    os.getenv("FRAMERATE",     "30"),
-    "video_bitrate":os.getenv("VIDEO_BITRATE", "1500k"),
+    "x264_preset": os.getenv("X264_PRESET", "veryfast"),
+    "video_crf":    os.getenv("VIDEO_CRF",    "28"),
     "segment_secs": int(os.getenv("SEGMENT_SECS", "60")),
+    "audio_bitrate":os.getenv("AUDIO_BITRATE", "96k"),
 
     # MinIO
     "minio_endpoint":   os.getenv("MINIO_ENDPOINT",   "192.168.1.10:9000"),
@@ -94,12 +96,18 @@ def build_ffmpeg_cmd() -> list[str]:
         # Audio input
         "-f", "alsa",
         "-i", CONFIG["audio_card"],
-        # Video — keep camera MJPEG as-is. Hardware H.264 path produced rainbow output
-        # on this capture device, while MJPEG passthrough is known-good.
-        "-c:v", "copy",
+        # Video encode — software H.264 is stable on this RPi 4B setup.
+        # Hardware H.264 caused rainbow output; MJPEG copy was too large.
+        "-vf", "format=yuv420p",
+        "-c:v", "libx264",
+        "-preset", CONFIG["x264_preset"],
+        "-crf", CONFIG["video_crf"],
+        "-g", str(int(CONFIG["framerate"]) * 2),  # keyframe every 2s
+        "-keyint_min", str(int(CONFIG["framerate"]) * 2),
+        "-sc_threshold", "0",
         # Audio encode
         "-c:a", "aac",
-        "-b:a", "128k",
+        "-b:a", CONFIG["audio_bitrate"],
         "-ar", "48000",
         "-ac", "2",
         # Segment muxer
@@ -414,7 +422,8 @@ def main():
     log.info("IPTV Capture & Upload")
     log.info(f"  Channel  : {CONFIG['channel_name']}")
     log.info(f"  Video    : {CONFIG['video_dev']} @ {CONFIG['resolution']}p{CONFIG['framerate']}")
-    log.info(f"  Audio    : {CONFIG['audio_card']}")
+    log.info(f"  Encoder  : libx264 preset={CONFIG['x264_preset']} crf={CONFIG['video_crf']}")
+    log.info(f"  Audio    : {CONFIG['audio_card']} @ {CONFIG['audio_bitrate']}")
     log.info(f"  Segments : {SEGMENTS_DIR} ({CONFIG['segment_secs']}s each → .mkv clips)")
     log.info(f"  Min dur  : {CONFIG['min_segment_secs']}s before upload")
     log.info(f"  MinIO    : {CONFIG['minio_endpoint']} / {CONFIG['minio_bucket']}")
