@@ -85,6 +85,8 @@ class Settings(BaseSettings):
     RABBITMQ_PASSWORD: str = Field(
         default="guest", description="RabbitMQ password"
     )
+    RABBITMQ_VHOST: str = Field(default="/", description="RabbitMQ virtual host")
+    RABBITMQ_SSL: bool = Field(default=False, description="Use AMQPS (SSL/TLS)")
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 

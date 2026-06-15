@@ -14,6 +14,7 @@ Usage:
 """
 
 import json
+import ssl
 import pika
 
 from app.schemas.job import DiarizationJob
@@ -35,10 +36,13 @@ class RabbitMQPublisher:
         self.queue = settings.RABBITMQ_QUEUE
         self.username = settings.RABBITMQ_USERNAME
         self.password = settings.RABBITMQ_PASSWORD
+        self.vhost = settings.RABBITMQ_VHOST
+        self.use_ssl = settings.RABBITMQ_SSL
         self._connection = None
         self._channel = None
 
-        logger.info(f"RabbitMQ publisher initialized (host={self.host}:{self.port}, queue={self.queue})")
+        proto = "AMQPS" if self.use_ssl else "AMQP"
+        logger.info(f"RabbitMQ publisher initialized ({proto} {self.host}:{self.port}, queue={self.queue})")
 
     def _get_channel(self) -> pika.channel.Channel:
         """Get a channel, creating a new connection if needed."""
@@ -49,10 +53,20 @@ class RabbitMQPublisher:
         self._close_connection()
 
         credentials = pika.PlainCredentials(self.username, self.password)
+
+        ssl_options = None
+        if self.use_ssl:
+            ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
+            ssl_options = pika.SSLOptions(ssl_context, self.host)
+
         params = pika.ConnectionParameters(
             host=self.host,
             port=self.port,
             credentials=credentials,
+            virtual_host=self.vhost,
+            ssl_options=ssl_options,
             heartbeat=600,
             blocked_connection_timeout=300,
         )
