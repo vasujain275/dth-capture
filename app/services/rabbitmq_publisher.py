@@ -103,7 +103,7 @@ class RabbitMQPublisher:
                 routing_key=self.queue,
                 body=body.encode("utf-8"),
                 properties=pika.BasicProperties(
-                    delivery_mode=pika.DeliveryMode.PERSISTENT,
+                    delivery_mode=pika.DeliveryMode.Persistent,
                     content_type="application/json",
                 ),
             )
