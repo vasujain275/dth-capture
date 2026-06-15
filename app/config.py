@@ -77,7 +77,7 @@ class Settings(BaseSettings):
     )
     RABBITMQ_PORT: int = Field(default=5672, description="RabbitMQ port")
     RABBITMQ_QUEUE: str = Field(
-        default="diarization-jobs", description="Queue name for job messages"
+        default="stock-market-jobs", description="Queue name for job messages"
     )
     RABBITMQ_USERNAME: str = Field(
         default="guest", description="RabbitMQ username"

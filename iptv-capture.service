@@ -4,10 +4,10 @@ After=network.target
 
 [Service]
 Type=simple
-User=pi
-WorkingDirectory=/home/pi/dth-capture
-EnvironmentFile=/home/pi/dth-capture/.env
-ExecStart=/home/pi/dth-capture/.venv/bin/python -m app.main
+User=rpi4b
+WorkingDirectory=/home/rpi4b/dth-capture
+EnvironmentFile=/home/rpi4b/dth-capture/.env
+ExecStart=/home/rpi4b/dth-capture/.venv/bin/python -m app.main
 Restart=always
 RestartSec=5
 
